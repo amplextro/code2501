@@ -37,12 +37,6 @@ const FINDER_PATTERN = (() => {
   return p;
 })();
 
-// ─── Sync column pattern ───
-function syncCol(colIdx) {
-  // col 0 = all black, col 1 = all white
-  return Array.from({ length: ROWS }, () => (colIdx === 0 ? 1 : 0));
-}
-
 // ─── UTF-8 encode a single codepoint ───
 function utf8Encode(char) {
   const code = char.codePointAt(0);
@@ -272,8 +266,8 @@ function encodeCode2501(text, eccInterval = 10, eccLevel = 1) {
   return glyphs;
 }
 
-// ─── Compose glyphs into single bitmap ───
-function composeBitmap(glyphs) {
+// ─── Compose a single line of glyphs into bitmap ───
+function composeLine(glyphs) {
   const totalCols = glyphs.reduce((sum, g) => sum + g.grid[0].length, 0);
   const bitmap = Array.from({ length: ROWS }, () => Array(totalCols).fill(0));
   let offset = 0;
@@ -298,6 +292,45 @@ function composeBitmap(glyphs) {
   return { bitmap, totalCols, glyphBoundaries };
 }
 
+// ─── Split glyphs into visual lines ───
+// Hard break: \n CHAR glyph (encoded in stream, decoder sees it)
+// Soft break: width overflow (visual only, decoder ignores)
+const LINE_GAP = 2; // gap between lines in cells
+
+function composeLines(glyphs, maxCols) {
+  const lines = [];
+  let currentGlyphs = [];
+  let currentWidth = 0;
+
+  for (const g of glyphs) {
+    const w = g.grid[0].length;
+    const isNewline = g.type === "CHAR" && g.char === "\n";
+
+    // Soft break: would exceed maxCols
+    if (maxCols > 0 && currentWidth + w > maxCols && currentGlyphs.length > 0) {
+      lines.push(composeLine(currentGlyphs));
+      currentGlyphs = [];
+      currentWidth = 0;
+    }
+
+    currentGlyphs.push(g);
+    currentWidth += w;
+
+    // Hard break: \n glyph is included in the line, then break
+    if (isNewline) {
+      lines.push(composeLine(currentGlyphs));
+      currentGlyphs = [];
+      currentWidth = 0;
+    }
+  }
+
+  if (currentGlyphs.length > 0) {
+    lines.push(composeLine(currentGlyphs));
+  }
+
+  return lines;
+}
+
 // ─── Main Component ───
 export default function Code2501Prototype() {
   const [text, setText] = useState(
@@ -305,61 +338,86 @@ export default function Code2501Prototype() {
   );
   const [eccInterval, setEccInterval] = useState(10);
   const [cellSize, setCellSize] = useState(4);
-  const [hoveredGlyph, setHoveredGlyph] = useState(null);
+  const [hoveredGlyph, setHoveredGlyph] = useState(null); // { lineIdx, glyphIdx }
+  const [containerWidth, setContainerWidth] = useState(0);
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
 
+  // Measure container width
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        // subtract padding (12px * 2)
+        setContainerWidth(entry.contentRect.width);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   const glyphs = encodeCode2501(text, eccInterval);
-  const { bitmap, totalCols, glyphBoundaries } = composeBitmap(glyphs);
+  const maxCols = containerWidth > 0 ? Math.floor(containerWidth / cellSize) : 0;
+  const lines = composeLines(glyphs, maxCols);
+  const totalGlyphs = glyphs.length;
+  const totalCols = glyphs.reduce((sum, g) => sum + g.grid[0].length, 0);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
-    const w = totalCols * cellSize;
-    const h = ROWS * cellSize;
+    const widestLine = Math.max(...lines.map((l) => l.totalCols));
+    const w = widestLine * cellSize;
+    const h = lines.length * (ROWS + LINE_GAP) * cellSize - LINE_GAP * cellSize;
     canvas.width = w;
     canvas.height = h;
 
     ctx.fillStyle = "#0a0a0a";
     ctx.fillRect(0, 0, w, h);
 
-    for (let r = 0; r < ROWS; r++) {
-      for (let c = 0; c < totalCols; c++) {
-        if (bitmap[r][c]) {
-          ctx.fillStyle = "#e0e0e0";
-          ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+    for (let li = 0; li < lines.length; li++) {
+      const line = lines[li];
+      const yOff = li * (ROWS + LINE_GAP) * cellSize;
+
+      // Draw cells
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < line.totalCols; c++) {
+          if (line.bitmap[r][c]) {
+            ctx.fillStyle = "#e0e0e0";
+            ctx.fillRect(c * cellSize, yOff + r * cellSize, cellSize, cellSize);
+          }
+        }
+      }
+
+      // Glyph boundary lines
+      if (cellSize >= 3) {
+        ctx.strokeStyle = "rgba(0, 255, 180, 0.15)";
+        ctx.lineWidth = 1;
+        for (const b of line.glyphBoundaries) {
+          ctx.beginPath();
+          ctx.moveTo(b.start * cellSize, yOff);
+          ctx.lineTo(b.start * cellSize, yOff + ROWS * cellSize);
+          ctx.stroke();
+        }
+      }
+
+      // Highlight hovered glyph
+      if (hoveredGlyph !== null && hoveredGlyph.lineIdx === li) {
+        const b = line.glyphBoundaries[hoveredGlyph.glyphIdx];
+        if (b) {
+          ctx.strokeStyle = "rgba(0, 255, 180, 0.6)";
+          ctx.lineWidth = 2;
+          ctx.strokeRect(
+            b.start * cellSize,
+            yOff,
+            b.width * cellSize,
+            ROWS * cellSize,
+          );
         }
       }
     }
-
-    // Glyph boundary lines
-    if (cellSize >= 3) {
-      ctx.strokeStyle = "rgba(0, 255, 180, 0.15)";
-      ctx.lineWidth = 1;
-      for (const b of glyphBoundaries) {
-        ctx.beginPath();
-        ctx.moveTo(b.start * cellSize, 0);
-        ctx.lineTo(b.start * cellSize, h);
-        ctx.stroke();
-      }
-    }
-
-    // Highlight hovered glyph
-    if (hoveredGlyph !== null) {
-      const b = glyphBoundaries[hoveredGlyph];
-      if (b) {
-        ctx.strokeStyle = "rgba(0, 255, 180, 0.6)";
-        ctx.lineWidth = 2;
-        ctx.strokeRect(
-          b.start * cellSize,
-          0,
-          b.width * cellSize,
-          ROWS * cellSize,
-        );
-      }
-    }
-  }, [bitmap, totalCols, cellSize, hoveredGlyph, glyphBoundaries]);
+  }, [lines, cellSize, hoveredGlyph]);
 
   useEffect(() => {
     draw();
@@ -370,12 +428,23 @@ export default function Code2501Prototype() {
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-    const col = Math.floor(x / cellSize);
+    const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+    const lineHeight = (ROWS + LINE_GAP) * cellSize;
+    const li = Math.floor(y / lineHeight);
+    const rowInLine = y - li * lineHeight;
 
-    for (let i = 0; i < glyphBoundaries.length; i++) {
-      const b = glyphBoundaries[i];
+    // Ignore if in gap area or out of bounds
+    if (li < 0 || li >= lines.length || rowInLine > ROWS * cellSize) {
+      setHoveredGlyph(null);
+      return;
+    }
+
+    const col = Math.floor(x / cellSize);
+    const line = lines[li];
+    for (let i = 0; i < line.glyphBoundaries.length; i++) {
+      const b = line.glyphBoundaries[i];
       if (col >= b.start && col < b.start + b.width) {
-        setHoveredGlyph(i);
+        setHoveredGlyph({ lineIdx: li, glyphIdx: i });
         return;
       }
     }
@@ -384,12 +453,16 @@ export default function Code2501Prototype() {
 
   const stats = {
     chars: [...text].length,
-    glyphs: glyphs.length,
+    glyphs: totalGlyphs,
     totalCols,
+    lines: lines.length,
     dataBytes: [...text].reduce((s, ch) => s + utf8Encode(ch).length, 0),
   };
 
-  const hovered = hoveredGlyph !== null ? glyphBoundaries[hoveredGlyph] : null;
+  const hovered =
+    hoveredGlyph !== null
+      ? lines[hoveredGlyph.lineIdx]?.glyphBoundaries[hoveredGlyph.glyphIdx]
+      : null;
 
   return (
     <div
@@ -559,10 +632,7 @@ export default function Code2501Prototype() {
           TOTAL COLS <span style={{ color: "#00ffb4" }}>{stats.totalCols}</span>
         </span>
         <span>
-          GRID{" "}
-          <span style={{ color: "#00ffb4" }}>
-            {stats.totalCols}×{ROWS}
-          </span>
+          LINES <span style={{ color: "#00ffb4" }}>{stats.lines}</span>
         </span>
       </div>
 
