@@ -295,7 +295,7 @@ function composeLine(glyphs) {
 // ─── Split glyphs into visual lines ───
 // Hard break: \n CHAR glyph (encoded in stream, decoder sees it)
 // Soft break: width overflow (visual only, decoder ignores)
-const LINE_GAP = 2; // gap between lines in cells
+const LINE_GAP = 4; // separator: clock(1) + blank(2) + clock(1)
 
 function composeLines(glyphs, maxCols) {
   const lines = [];
@@ -400,6 +400,21 @@ export default function Code2501Prototype() {
           ctx.lineTo(b.start * cellSize, yOff + ROWS * cellSize);
           ctx.stroke();
         }
+      }
+
+      // Separator pattern between lines (clock + blank + blank + clock)
+      if (li < lines.length - 1) {
+        const sepY = yOff + ROWS * cellSize;
+        ctx.fillStyle = "#e0e0e0";
+        for (let c = 0; c < widestLine; c++) {
+          if (c % 2 === 0) {
+            // Row 0: clock pattern
+            ctx.fillRect(c * cellSize, sepY, cellSize, cellSize);
+            // Row 3: clock pattern
+            ctx.fillRect(c * cellSize, sepY + 3 * cellSize, cellSize, cellSize);
+          }
+        }
+        // Rows 1-2 stay blank (background)
       }
 
       // Highlight hovered glyph
