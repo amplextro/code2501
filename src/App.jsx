@@ -300,7 +300,9 @@ function composeBitmap(glyphs) {
 
 // ─── Main Component ───
 export default function Code2501Prototype() {
-  const [text, setText] = useState("Hello世界！Code 2501 - Project 2501");
+  const [text, setText] = useState(
+    "童の時は、語ることも童の如く、思うことも童の如く、論ずることも童の如くなりしが、人となりては、童のことを棄てたり。",
+  );
   const [eccInterval, setEccInterval] = useState(10);
   const [cellSize, setCellSize] = useState(4);
   const [hoveredGlyph, setHoveredGlyph] = useState(null);
