@@ -8,9 +8,9 @@ const DATA_COLS = 8;
 const PARITY_COLS = 2;
 const CHAR_GLYPH_WIDTH = SYNC_COLS + BYTELEN_COLS + DATA_COLS + PARITY_COLS; // 13
 const FINDER_COLS = 8;
-const HEADER_COLS = 8;
-const START_WIDTH = SYNC_COLS + FINDER_COLS + HEADER_COLS; // 18
-const STOP_WIDTH = START_WIDTH; // 18
+const HEADER_COLS = 16;
+const START_WIDTH = SYNC_COLS + FINDER_COLS + HEADER_COLS; // 26
+const STOP_WIDTH = START_WIDTH; // 26
 
 // ─── Finder Pattern (8x16) ───
 const FINDER_PATTERN = (() => {
@@ -499,7 +499,7 @@ export default function Code2501Prototype() {
         >
           CODE 2501
           <span style={{ color: "#444", fontWeight: 300, marginLeft: 8 }}>
-            v0.2 prototype
+            v0.3 prototype
           </span>
         </h1>
       </div>

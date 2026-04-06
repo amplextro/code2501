@@ -16,4 +16,4 @@ npm run dev
 
 ## Spec
 
-仕様書は [spec/code2501-spec-v0.2.md](spec/code2501-spec-v0.2.md) を参照。
+仕様書は [spec/code2501-spec.md](spec/code2501-spec.md) を参照。
