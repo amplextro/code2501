@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 // ─── Constants ───
 const ROWS = 16;
@@ -75,6 +75,20 @@ function gfMul(a, b) {
   return GF_EXP[GF_LOG[a] + GF_LOG[b]];
 }
 
+function gfDiv(a, b) {
+  if (b === 0) throw new Error("GF divide by zero");
+  if (a === 0) return 0;
+  return GF_EXP[(GF_LOG[a] - GF_LOG[b] + 255) % 255];
+}
+
+function gfPolyEval(poly, x) {
+  let result = 0;
+  for (let i = 0; i < poly.length; i++) {
+    result = gfMul(result, x) ^ poly[i];
+  }
+  return result;
+}
+
 // Generate RS ECC symbols for given data bytes over GF(2^8)
 function rsEncode(data, nsym) {
   // Generator polynomial: product of (x - α^i) for i=0..nsym-1
@@ -97,6 +111,94 @@ function rsEncode(data, nsym) {
     }
   }
   return ecc;
+}
+
+// RS decode: correct errors in-place, returns { corrected, errors } or null if uncorrectable
+function rsDecode(message, nsym) {
+  const n = message.length; // data + ecc
+
+  // 1. Syndromes
+  const synd = new Uint8Array(nsym);
+  let hasError = false;
+  for (let i = 0; i < nsym; i++) {
+    synd[i] = gfPolyEval(message, GF_EXP[i]);
+    if (synd[i] !== 0) hasError = true;
+  }
+  if (!hasError) return { corrected: message.slice(0, n - nsym), errors: 0 };
+
+  // 2. Berlekamp-Massey
+  let errLoc = [1];
+  let oldLoc = [1];
+  for (let i = 0; i < nsym; i++) {
+    let delta = synd[i];
+    for (let j = 1; j < errLoc.length; j++) {
+      delta ^= gfMul(errLoc[errLoc.length - 1 - j], synd[i - j]);
+    }
+    oldLoc.push(0);
+    if (delta !== 0) {
+      if (oldLoc.length > errLoc.length) {
+        const newLoc = oldLoc.map((v) => gfMul(v, delta));
+        oldLoc = errLoc.map((v) => gfMul(v, gfDiv(1, delta)));
+        errLoc = newLoc;
+      }
+      for (let j = 0; j < oldLoc.length; j++) {
+        errLoc[errLoc.length - 1 - j] ^= gfMul(
+          delta,
+          oldLoc[oldLoc.length - 1 - j],
+        );
+      }
+    }
+  }
+
+  const numErrors = errLoc.length - 1;
+  if (numErrors * 2 > nsym) return null; // too many errors
+
+  // 3. Chien search: find error positions
+  const errPos = [];
+  for (let i = 0; i < n; i++) {
+    if (gfPolyEval(errLoc, GF_EXP[255 - i]) === 0) {
+      errPos.push(n - 1 - i);
+    }
+  }
+  if (errPos.length !== numErrors) return null; // couldn't locate all errors
+
+  // 4. Forney algorithm: compute error magnitudes
+  // Error evaluator polynomial = synd * errLoc mod x^nsym
+  const syndPoly = [...synd].reverse();
+  let errEval = [];
+  for (let i = 0; i < nsym; i++) {
+    let val = 0;
+    for (let j = 0; j <= i; j++) {
+      if (j < syndPoly.length && i - j < errLoc.length) {
+        val ^= gfMul(syndPoly[j], errLoc[errLoc.length - 1 - (i - j)]);
+      }
+    }
+    errEval.push(val);
+  }
+  // Formal derivative of error locator
+  const errLocDeriv = [];
+  for (let i = errLoc.length - 2; i >= 0; i -= 2) {
+    errLocDeriv.push(errLoc[i]);
+  }
+  errLocDeriv.reverse();
+
+  // Correct errors
+  const corrected = new Uint8Array(message);
+  for (const pos of errPos) {
+    const xi = GF_EXP[255 - pos]; // X_i inverse
+    const errEvalVal = gfPolyEval(errEval, xi);
+    const errLocDerivVal = gfPolyEval(errLocDeriv, xi);
+    if (errLocDerivVal === 0) return null;
+    const magnitude = gfDiv(errEvalVal, errLocDerivVal);
+    corrected[pos] ^= magnitude;
+  }
+
+  // Verify correction
+  for (let i = 0; i < nsym; i++) {
+    if (gfPolyEval(corrected, GF_EXP[i]) !== 0) return null;
+  }
+
+  return { corrected: corrected.slice(0, n - nsym), errors: numErrors };
 }
 
 // ─── Build a CHAR glyph (16 x 13) ───
@@ -266,6 +368,185 @@ function encodeCode2501(text, eccInterval = 10, eccLevel = 1) {
   return glyphs;
 }
 
+// ─── Decoder ───
+
+function utf8Decode(bytes) {
+  const len = bytes.length;
+  let code;
+  if (len === 1) code = bytes[0];
+  else if (len === 2) code = ((bytes[0] & 0x1f) << 6) | (bytes[1] & 0x3f);
+  else if (len === 3)
+    code =
+      ((bytes[0] & 0x0f) << 12) | ((bytes[1] & 0x3f) << 6) | (bytes[2] & 0x3f);
+  else
+    code =
+      ((bytes[0] & 0x07) << 18) |
+      ((bytes[1] & 0x3f) << 12) |
+      ((bytes[2] & 0x3f) << 6) |
+      (bytes[3] & 0x3f);
+  if (code < 0 || code > 0x10ffff) return "\uFFFD";
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return "\uFFFD";
+  }
+}
+
+function isSyncBar(bitmap, col) {
+  if (col + 1 >= bitmap[0].length) return false;
+  for (let r = 0; r < ROWS; r++) {
+    if (bitmap[r][col] !== 1 || bitmap[r][col + 1] !== 0) return false;
+  }
+  return true;
+}
+
+function isStartFinder(bitmap, col) {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < FINDER_COLS; c++) {
+      if (bitmap[r][col + 2 + c] !== FINDER_PATTERN[r][c]) return false;
+    }
+  }
+  return true;
+}
+
+function isStopFinder(bitmap, col) {
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < FINDER_COLS; c++) {
+      if (bitmap[r][col + 2 + c] !== FINDER_PATTERN[r][FINDER_COLS - 1 - c])
+        return false;
+    }
+  }
+  return true;
+}
+
+function isEccMarker(bitmap, col) {
+  for (let r = 0; r < ROWS; r++) {
+    if (bitmap[r][col + 2] !== 1) return false;
+  }
+  return true;
+}
+
+function decodeCharAt(bitmap, col) {
+  const lenBit0 = bitmap[0][col + 2];
+  const lenBit1 = bitmap[1][col + 2];
+  const byteLen = Math.min(4, Math.max(1, ((lenBit0 << 1) | lenBit1) + 1));
+
+  // Read all 16 rows as a message: data bytes + ECC bytes
+  const message = new Uint8Array(ROWS);
+  for (let r = 0; r < ROWS; r++) {
+    let byte = 0;
+    for (let bit = 7; bit >= 0; bit--) {
+      byte |= bitmap[r][col + 3 + (7 - bit)] << bit;
+    }
+    message[r] = byte;
+  }
+
+  const nsym = ROWS - byteLen;
+  try {
+    const result = rsDecode(message, nsym);
+    if (result) {
+      return {
+        char: utf8Decode([...result.corrected]),
+        eccValid: true,
+        corrected: result.errors,
+      };
+    }
+  } catch {
+    // RS decode threw — fall through to raw read
+  }
+
+  // Uncorrectable: return raw data without correction
+  try {
+    const rawBytes = [...message.slice(0, byteLen)];
+    return { char: utf8Decode(rawBytes), eccValid: false, corrected: 0 };
+  } catch {
+    return { char: "\uFFFD", eccValid: false, corrected: 0 };
+  }
+}
+
+function decodeBitmap(bitmap, totalCols) {
+  const chars = [];
+  let eccErrors = 0;
+  let eccCorrected = 0;
+  let col = 0;
+
+  while (col < totalCols) {
+    if (!isSyncBar(bitmap, col)) {
+      col++;
+      continue;
+    }
+
+    if (col + START_WIDTH <= totalCols && isStartFinder(bitmap, col)) {
+      col += START_WIDTH;
+    } else if (col + STOP_WIDTH <= totalCols && isStopFinder(bitmap, col)) {
+      break;
+    } else if (
+      col + CHAR_GLYPH_WIDTH <= totalCols &&
+      isEccMarker(bitmap, col)
+    ) {
+      col += CHAR_GLYPH_WIDTH;
+    } else if (col + CHAR_GLYPH_WIDTH <= totalCols) {
+      try {
+        const { char, eccValid, corrected } = decodeCharAt(bitmap, col);
+        chars.push(char);
+        if (!eccValid) eccErrors++;
+        eccCorrected += corrected;
+      } catch {
+        eccErrors++;
+        chars.push("\uFFFD"); // replacement character
+      }
+      col += CHAR_GLYPH_WIDTH;
+    } else {
+      col++;
+    }
+  }
+
+  return { text: chars.join(""), eccErrors, eccCorrected };
+}
+
+// ─── Apply random bit flips to bitmap (data area only, skip sync bars) ───
+function applyNoise(bitmap, totalCols, flipRate) {
+  if (flipRate <= 0) return bitmap;
+  const noisy = bitmap.map((row) => [...row]);
+  // Walk through glyphs by detecting sync bars
+  let col = 0;
+  while (col < totalCols) {
+    // Check for sync bar
+    let isSync = col + 1 < totalCols;
+    if (isSync) {
+      for (let r = 0; r < ROWS; r++) {
+        if (bitmap[r][col] !== 1 || bitmap[r][col + 1] !== 0) {
+          isSync = false;
+          break;
+        }
+      }
+    }
+    if (!isSync) {
+      col++;
+      continue;
+    }
+
+    // Determine glyph width
+    let w = CHAR_GLYPH_WIDTH; // default
+    if (col + START_WIDTH <= totalCols && isStartFinder(bitmap, col)) {
+      w = START_WIDTH;
+    } else if (col + STOP_WIDTH <= totalCols && isStopFinder(bitmap, col)) {
+      w = STOP_WIDTH;
+    }
+
+    // Flip bits only in data area (skip sync cols 0-1)
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 2; c < w && col + c < totalCols; c++) {
+        if (Math.random() < flipRate) {
+          noisy[r][col + c] ^= 1;
+        }
+      }
+    }
+    col += w;
+  }
+  return noisy;
+}
+
 // ─── Compose a single line of glyphs into bitmap ───
 function composeLine(glyphs) {
   const totalCols = glyphs.reduce((sum, g) => sum + g.grid[0].length, 0);
@@ -338,6 +619,8 @@ export default function Code2501Prototype() {
   );
   const [eccInterval, setEccInterval] = useState(10);
   const [cellSize, setCellSize] = useState(4);
+  const [noiseRate, setNoiseRate] = useState(0);
+  const [noiseSeed, setNoiseSeed] = useState(0); // bump to regenerate noise
   const [hoveredGlyph, setHoveredGlyph] = useState(null); // { lineIdx, glyphIdx }
   const [containerWidth, setContainerWidth] = useState(0);
   const canvasRef = useRef(null);
@@ -358,10 +641,22 @@ export default function Code2501Prototype() {
   }, []);
 
   const glyphs = encodeCode2501(text, eccInterval);
-  const maxCols = containerWidth > 0 ? Math.floor(containerWidth / cellSize) : 0;
+  const maxCols =
+    containerWidth > 0 ? Math.floor(containerWidth / cellSize) : 0;
   const lines = composeLines(glyphs, maxCols);
   const totalGlyphs = glyphs.length;
   const totalCols = glyphs.reduce((sum, g) => sum + g.grid[0].length, 0);
+
+  // Round-trip: decode from flat bitmap (with optional noise)
+  const decoded = useMemo(() => {
+    void noiseSeed; // dependency to allow re-roll
+    const flat = composeLine(glyphs);
+    const bitmap =
+      noiseRate > 0
+        ? applyNoise(flat.bitmap, flat.totalCols, noiseRate)
+        : flat.bitmap;
+    return decodeBitmap(bitmap, flat.totalCols);
+  }, [glyphs, noiseRate, noiseSeed]);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
@@ -619,6 +914,46 @@ export default function Code2501Prototype() {
               {cellSize}px
             </span>
           </div>
+          <div>
+            <label
+              style={{
+                fontSize: 11,
+                color: noiseRate > 0 ? "#ff8800" : "#666",
+                display: "block",
+                marginBottom: 4,
+                letterSpacing: "0.08em",
+              }}
+            >
+              NOISE {(noiseRate * 100).toFixed(1)}%
+            </label>
+            <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              <input
+                type="range"
+                min={0}
+                max={0.3}
+                step={0.005}
+                value={noiseRate}
+                onChange={(e) => setNoiseRate(+e.target.value)}
+                style={{ width: 80, accentColor: "#ff8800" }}
+              />
+              {noiseRate > 0 && (
+                <button
+                  onClick={() => setNoiseSeed((s) => s + 1)}
+                  style={{
+                    background: "#222",
+                    border: "1px solid #444",
+                    color: "#aaa",
+                    fontSize: 10,
+                    padding: "2px 6px",
+                    borderRadius: 3,
+                    cursor: "pointer",
+                  }}
+                >
+                  re-roll
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -724,6 +1059,72 @@ export default function Code2501Prototype() {
           <span style={{ color: "#333" }}>
             hover over barcode to inspect glyphs
           </span>
+        )}
+      </div>
+      {/* Round-trip verification */}
+      <div
+        style={{
+          marginTop: 16,
+          borderTop: "1px solid #1a3a2a",
+          paddingTop: 16,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            color: "#666",
+            letterSpacing: "0.08em",
+            marginBottom: 8,
+          }}
+        >
+          ROUND-TRIP VERIFICATION
+          <span
+            style={{
+              marginLeft: 12,
+              color: decoded.text === text ? "#00ffb4" : "#ff4444",
+              fontWeight: 600,
+            }}
+          >
+            {decoded.text === text ? "MATCH" : "MISMATCH"}
+          </span>
+          {decoded.eccCorrected > 0 && (
+            <span style={{ marginLeft: 12, color: "#ffcc00" }}>
+              CORRECTED: {decoded.eccCorrected} glyphs
+            </span>
+          )}
+          {decoded.eccErrors > 0 && (
+            <span style={{ marginLeft: 12, color: "#ff4444" }}>
+              UNCORRECTABLE: {decoded.eccErrors} glyphs
+            </span>
+          )}
+        </div>
+        <div
+          style={{
+            fontSize: 12,
+            color: "#555",
+            fontFamily: "inherit",
+            display: "flex",
+            gap: 24,
+          }}
+        >
+          <span>input: {[...text].length} chars</span>
+          <span>decoded: {[...decoded.text].length} chars</span>
+        </div>
+        {decoded.text !== text && (
+          <div
+            style={{
+              marginTop: 8,
+              padding: "8px 12px",
+              background: "#1a0000",
+              border: "1px solid #331111",
+              borderRadius: 4,
+              fontSize: 12,
+              color: "#ff6666",
+              wordBreak: "break-all",
+            }}
+          >
+            decoded: {decoded.text}
+          </div>
         )}
       </div>
     </div>
