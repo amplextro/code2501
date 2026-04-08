@@ -1,6 +1,6 @@
 # Proposal: チャンク読み（Chunked Reading）
 
-**Status**: Draft
+**Status**: Rejected
 **Target**: v0.4
 
 ## 概要
